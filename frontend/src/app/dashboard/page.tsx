@@ -1,32 +1,50 @@
 'use client'
+// src/app/dashboard/page.tsx
+// FIX: project.overall_score was always 0 / null because the /projects/ list
+// endpoint does NOT return overall_score — that lives in the report data
+// fetched by getReport(id). We now build a `scoreMap` (projectId → score) by
+// fetching each completed project's report, and use that map in the project
+// card and the stats "Avg SEO Score" tile.
+
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
-import { getProjects, deleteProject, getProfile, getAudience, getCompetitors, getReport, getAgentAnalytics } from '@/lib/api'
+import {
+  getProjects, deleteProject, getProfile, getAudience,
+  getCompetitors, getReport, getAgentAnalytics,
+} from '@/lib/api'
 import { useAuth } from '@/lib/auth'
 import ScoreRing from '@/components/ScoreRing'
 import StatusBadge from '@/components/StatusBadge'
 import {
-  PlusCircle, Trash2, ExternalLink, TrendingUp, AlertTriangle, Search, FileText,
-  Building2, Users, Swords, Bot, ExternalLinkIcon,
+  PlusCircle, Trash2, ExternalLink, TrendingUp, AlertTriangle,
+  Search, FileText, Building2, Users, Swords, Bot, ExternalLinkIcon,
 } from 'lucide-react'
 
 interface Project {
-  id: number; business_name: string; status: string
-  website_url?: string; target_location: string; created_at: string
-  overall_score?: number; pages_crawled?: number
+  id: number
+  business_name: string
+  status: string
+  website_url?: string
+  target_location: string
+  created_at: string
+  overall_score?: number   // may be absent from list endpoint
+  pages_crawled?: number
 }
 
 export default function DashboardPage() {
   const { user } = useAuth()
-  const [projects, setProjects] = useState<Project[]>([])
-  const [loading, setLoading] = useState(true)
-
-  const [profile, setProfile] = useState<any>(null)
-  const [audience, setAudience] = useState<any>(null)
+  const [projects, setProjects]       = useState<Project[]>([])
+  const [loading, setLoading]         = useState(true)
+  const [profile, setProfile]         = useState<any>(null)
+  const [audience, setAudience]       = useState<any>(null)
   const [competitors, setCompetitors] = useState<any[]>([])
-  const [agents, setAgents] = useState<any[]>([])
+  const [agents, setAgents]           = useState<any[]>([])
   const [latestReport, setLatestReport] = useState<any>(null)
 
+  // Map of projectId → overall_score fetched from report data
+  const [scoreMap, setScoreMap] = useState<Record<number, number>>({})
+
+  // ── Fetch project list ────────────────────────────────────────────────────
   const fetchProjects = async () => {
     try {
       const { data } = await getProjects()
@@ -35,25 +53,56 @@ export default function DashboardPage() {
     setLoading(false)
   }
 
+  // ── Fetch sidebar cards ───────────────────────────────────────────────────
   const fetchExtras = async () => {
-    try { setProfile((await getProfile()).data) } catch {}
-    try { setAudience((await getAudience()).data) } catch {}
-    try { setCompetitors((await getCompetitors()).data) } catch {}
-    try { setAgents((await getAgentAnalytics()).data) } catch {}
+    try { setProfile((await getProfile()).data)           } catch {}
+    try { setAudience((await getAudience()).data)         } catch {}
+    try { setCompetitors((await getCompetitors()).data)   } catch {}
+    try { setAgents((await getAgentAnalytics()).data)     } catch {}
   }
 
   useEffect(() => { fetchProjects(); fetchExtras() }, [])
 
+  // ── Once projects are loaded, fetch scores for every completed project ────
+  // The /projects/ list endpoint does NOT populate overall_score — that value
+  // lives in report_data.seo_scores.overall_score returned by getReport(id).
   useEffect(() => {
-    const completedProjects = projects.filter(p => p.status === 'completed')
-    if (completedProjects.length === 0) return
-    const latest = completedProjects[0]
-    getReport(latest.id).then(({ data }) => setLatestReport({ ...data, business_name: latest.business_name })).catch(() => {})
+    const completed = projects.filter((p) => p.status === 'completed')
+    if (completed.length === 0) return
+
+    completed.forEach(async (p) => {
+      // Skip if we already have the score
+      if (scoreMap[p.id] !== undefined) return
+      try {
+        const { data } = await getReport(p.id)
+        // The report endpoint returns { overall_score, report_data, ... }
+        const score =
+          data.overall_score ??
+          data.report_data?.seo_scores?.overall_score ??
+          data.seo_scores?.overall_score ??
+          null
+        if (score !== null) {
+          setScoreMap((prev) => ({ ...prev, [p.id]: Math.round(score) }))
+        }
+      } catch {}
+    })
+  }, [projects]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Latest completed report card ─────────────────────────────────────────
+  useEffect(() => {
+    const completed = projects.filter((p) => p.status === 'completed')
+    if (completed.length === 0) return
+    const latest = completed[0]
+    getReport(latest.id)
+      .then(({ data }) => setLatestReport({ ...data, business_name: latest.business_name }))
+      .catch(() => {})
   }, [projects])
 
-  // Auto-refresh if any projects are running
+  // ── Auto-refresh while any project is running ─────────────────────────────
   useEffect(() => {
-    const hasRunning = projects.some(p => p.status === 'running' || p.status === 'pending')
+    const hasRunning = projects.some(
+      (p) => p.status === 'running' || p.status === 'pending',
+    )
     if (!hasRunning) return
     const timer = setInterval(() => { fetchProjects(); fetchExtras() }, 5000)
     return () => clearInterval(timer)
@@ -62,11 +111,25 @@ export default function DashboardPage() {
   const handleDelete = async (id: number) => {
     if (!confirm('Delete this project?')) return
     await deleteProject(id)
-    setProjects(p => p.filter(x => x.id !== id))
+    setProjects((p) => p.filter((x) => x.id !== id))
+    setScoreMap((prev) => { const next = { ...prev }; delete next[id]; return next })
   }
 
-  const completed = projects.filter(p => p.status === 'completed')
-  const avgScore = completed.length ? Math.round(completed.reduce((a, p) => a + (p.overall_score ?? 0), 0) / completed.length) : 0
+  // ── Derived stats ─────────────────────────────────────────────────────────
+  const completed  = projects.filter((p) => p.status === 'completed')
+
+  // Use scoreMap scores (fetched from reports) — fall back to project field
+  const scores = completed.map(
+    (p) => scoreMap[p.id] ?? p.overall_score ?? null,
+  ).filter((s): s is number => s !== null)
+
+  const avgScore = scores.length
+    ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
+    : 0
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  const projectScore = (p: Project): number | null =>
+    scoreMap[p.id] ?? (p.overall_score != null ? p.overall_score : null)
 
   return (
     <div className="max-w-6xl mx-auto">
@@ -80,13 +143,13 @@ export default function DashboardPage() {
         </Link>
       </div>
 
-      {/* Stats */}
+      {/* ── Stats ── */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
         {[
-          { label: 'Total Projects', value: projects.length, Icon: FileText, color: 'text-brand-600' },
-          { label: 'Completed', value: completed.length, Icon: TrendingUp, color: 'text-emerald-600' },
-          { label: 'Avg SEO Score', value: avgScore ? `${avgScore}/100` : '—', Icon: Search, color: 'text-blue-600' },
-          { label: 'Running', value: projects.filter(p => p.status === 'running').length, Icon: AlertTriangle, color: 'text-amber-600' },
+          { label: 'Total Projects', value: projects.length,                                  Icon: FileText,       color: 'text-brand-600'   },
+          { label: 'Completed',      value: completed.length,                                 Icon: TrendingUp,     color: 'text-emerald-600' },
+          { label: 'Avg SEO Score',  value: avgScore ? `${avgScore}/100` : '—',               Icon: Search,         color: 'text-blue-600'    },
+          { label: 'Running',        value: projects.filter((p) => p.status === 'running').length, Icon: AlertTriangle, color: 'text-amber-600' },
         ].map(({ label, value, Icon, color }) => (
           <div key={label} className="card">
             <Icon className={`w-6 h-6 ${color} mb-3`} />
@@ -96,8 +159,9 @@ export default function DashboardPage() {
         ))}
       </div>
 
-      {/* Profile / Audience / Competitor / Latest Report Cards */}
+      {/* ── Profile / Audience / Competitors / Latest Report ── */}
       <div className="grid md:grid-cols-2 gap-4 mb-8">
+
         {/* Profile Summary */}
         <div className="card">
           <div className="flex items-center gap-2 mb-4">
@@ -109,7 +173,9 @@ export default function DashboardPage() {
             <div className="space-y-1.5 text-sm text-slate-600">
               <p><span className="text-slate-400">Business:</span> {profile.business_name}</p>
               <p><span className="text-slate-400">Industry:</span> {profile.industry}</p>
-              {profile.website_url && <p><span className="text-slate-400">Website:</span> {profile.website_url}</p>}
+              {profile.website_url && (
+                <p><span className="text-slate-400">Website:</span> {profile.website_url}</p>
+              )}
               <p className="flex flex-wrap gap-1 mt-2">
                 {(profile.keywords || []).slice(0, 6).map((k: string) => (
                   <span key={k} className="badge-info">{k}</span>
@@ -128,14 +194,23 @@ export default function DashboardPage() {
           {audience ? (
             <div className="space-y-1.5 text-sm text-slate-600">
               <p><span className="text-slate-400">Age Group:</span> {audience.age_group}</p>
-              <p className="flex flex-wrap gap-1"><span className="text-slate-400">Interests:</span>
-                {(audience.interests || []).slice(0, 4).map((i: string) => <span key={i} className="badge-success ml-1">{i}</span>)}
+              <p className="flex flex-wrap gap-1">
+                <span className="text-slate-400">Interests:</span>
+                {(audience.interests || []).slice(0, 4).map((i: string) => (
+                  <span key={i} className="badge-success ml-1">{i}</span>
+                ))}
               </p>
-              <p className="flex flex-wrap gap-1"><span className="text-slate-400">Pain points:</span>
-                {(audience.pain_points || []).slice(0, 3).map((i: string) => <span key={i} className="badge-warning ml-1">{i}</span>)}
+              <p className="flex flex-wrap gap-1">
+                <span className="text-slate-400">Pain points:</span>
+                {(audience.pain_points || []).slice(0, 3).map((i: string) => (
+                  <span key={i} className="badge-warning ml-1">{i}</span>
+                ))}
               </p>
-              <p className="flex flex-wrap gap-1"><span className="text-slate-400">Platforms:</span>
-                {(audience.preferred_platforms || []).map((i: string) => <span key={i} className="badge-info ml-1">{i}</span>)}
+              <p className="flex flex-wrap gap-1">
+                <span className="text-slate-400">Platforms:</span>
+                {(audience.preferred_platforms || []).map((i: string) => (
+                  <span key={i} className="badge-info ml-1">{i}</span>
+                ))}
               </p>
             </div>
           ) : <p className="text-slate-400 text-sm">No audience persona yet.</p>}
@@ -162,7 +237,8 @@ export default function DashboardPage() {
                     <td className="py-2 font-medium text-slate-700">{c.name}</td>
                     <td className="py-2">
                       {c.website_url && (
-                        <a href={c.website_url} target="_blank" rel="noreferrer" className="text-brand-600 hover:underline flex items-center gap-1">
+                        <a href={c.website_url} target="_blank" rel="noreferrer"
+                          className="text-brand-600 hover:underline flex items-center gap-1">
                           Visit <ExternalLinkIcon className="w-3 h-3" />
                         </a>
                       )}
@@ -183,18 +259,32 @@ export default function DashboardPage() {
           </div>
           {latestReport ? (
             <div className="flex items-center gap-4">
-              <ScoreRing score={latestReport.overall_score ?? 0} size={64} />
+              <ScoreRing
+                score={
+                  latestReport.overall_score ??
+                  latestReport.report_data?.seo_scores?.overall_score ??
+                  latestReport.seo_scores?.overall_score ??
+                  0
+                }
+                size={64}
+              />
               <div className="text-sm text-slate-600 space-y-1">
                 <p className="font-medium text-slate-700">{latestReport.business_name}</p>
-                <p>Technical: {latestReport.report_data?.technical_score ?? '—'} | Content: {latestReport.report_data?.content_score ?? '—'} | Backlink: {latestReport.report_data?.backlink_score ?? '—'}</p>
-                <Link href="/reports" className="text-brand-600 text-xs hover:underline">View all recommendations →</Link>
+                <p>
+                  Technical: {latestReport.report_data?.technical_score ?? latestReport.seo_scores?.technical_score ?? '—'}
+                  {' | '}
+                  Content: {latestReport.report_data?.content_score ?? latestReport.seo_scores?.content_score ?? '—'}
+                </p>
+                <Link href="/reports" className="text-brand-600 text-xs hover:underline">
+                  View all recommendations →
+                </Link>
               </div>
             </div>
           ) : <p className="text-slate-400 text-sm">No completed reports yet.</p>}
         </div>
       </div>
 
-      {/* Agent Progress */}
+      {/* ── Agent Progress ── */}
       <div className="card mb-8">
         <div className="flex items-center gap-2 mb-4">
           <Bot className="w-5 h-5 text-brand-600" />
@@ -209,7 +299,10 @@ export default function DashboardPage() {
                   <StatusBadge status={a.status} />
                 </div>
                 <div className="w-full bg-slate-100 rounded-full h-2 mb-2">
-                  <div className="bg-brand-600 h-2 rounded-full transition-all" style={{ width: `${a.progress_pct}%` }} />
+                  <div
+                    className="bg-brand-600 h-2 rounded-full transition-all"
+                    style={{ width: `${a.progress_pct}%` }}
+                  />
                 </div>
                 <div className="flex justify-between text-xs text-slate-400">
                   <span>{a.completed_tasks} tasks completed</span>
@@ -218,10 +311,14 @@ export default function DashboardPage() {
               </div>
             ))}
           </div>
-        ) : <p className="text-slate-400 text-sm">Agents will appear here once you set up your profile.</p>}
+        ) : (
+          <p className="text-slate-400 text-sm">
+            Agents will appear here once you set up your profile.
+          </p>
+        )}
       </div>
 
-      {/* Projects list */}
+      {/* ── Projects list ── */}
       <h2 className="font-semibold text-slate-700 mb-4">Your Projects</h2>
 
       {loading ? (
@@ -237,45 +334,67 @@ export default function DashboardPage() {
         </div>
       ) : (
         <div className="grid gap-4">
-          {projects.map(project => (
-            <div key={project.id} className="card flex items-center gap-6 hover:shadow-md transition">
-              {project.status === 'completed' && project.overall_score != null ? (
-                <ScoreRing score={project.overall_score} size={80} />
-              ) : (
-                <div className="w-20 h-20 rounded-full bg-slate-100 flex items-center justify-center flex-shrink-0">
-                  <Search className="w-7 h-7 text-slate-300" />
-                </div>
-              )}
-
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2 mb-1">
-                  <h3 className="font-bold text-slate-800 text-lg">{project.business_name}</h3>
-                  <StatusBadge status={project.status} />
-                </div>
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-slate-500">
-                  {project.website_url && <span>🌐 {project.website_url}</span>}
-                  <span>📍 {project.target_location}</span>
-                  {project.pages_crawled != null && project.pages_crawled > 0 && (
-                    <span>📄 {project.pages_crawled} pages</span>
-                  )}
-                  <span>🕒 {new Date(project.created_at).toLocaleDateString()}</span>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-2 flex-shrink-0">
-                {project.status === 'completed' && (
-                  <Link href={`/reports/${project.id}`}
-                    className="btn-secondary flex items-center gap-2 text-sm py-2">
-                    <ExternalLink className="w-4 h-4" /> Report
-                  </Link>
+          {projects.map((project) => {
+            const score = projectScore(project)
+            return (
+              <div
+                key={project.id}
+                className="card flex items-center gap-6 hover:shadow-md transition"
+              >
+                {/* Score ring — show when completed AND we have a score */}
+                {project.status === 'completed' && score !== null ? (
+                  <ScoreRing score={score} size={80} />
+                ) : (
+                  <div className="w-20 h-20 rounded-full bg-slate-100 flex items-center justify-center flex-shrink-0">
+                    {project.status === 'completed' ? (
+                      // Completed but score still loading — show a subtle spinner
+                      <div className="w-7 h-7 rounded-full border-2 border-brand-300 border-t-brand-600 animate-spin" />
+                    ) : (
+                      <Search className="w-7 h-7 text-slate-300" />
+                    )}
+                  </div>
                 )}
-                <button onClick={() => handleDelete(project.id)}
-                  className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition">
-                  <Trash2 className="w-4 h-4" />
-                </button>
+
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1">
+                    <h3 className="font-bold text-slate-800 text-lg">{project.business_name}</h3>
+                    <StatusBadge status={project.status} />
+                  </div>
+                  <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-slate-500">
+                    {project.website_url && <span>🌐 {project.website_url}</span>}
+                    <span>📍 {project.target_location}</span>
+                    {project.pages_crawled != null && project.pages_crawled > 0 && (
+                      <span>📄 {project.pages_crawled} pages</span>
+                    )}
+                    <span>🕒 {new Date(project.created_at).toLocaleDateString()}</span>
+                    {/* Show the score as text next to the ring label */}
+                    {project.status === 'completed' && score !== null && (
+                      <span className="font-semibold text-brand-600">
+                        SEO Score: {score}/100
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  {project.status === 'completed' && (
+                    <Link
+                      href={`/reports/${project.id}`}
+                      className="btn-secondary flex items-center gap-2 text-sm py-2"
+                    >
+                      <ExternalLink className="w-4 h-4" /> Report
+                    </Link>
+                  )}
+                  <button
+                    onClick={() => handleDelete(project.id)}
+                    className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       )}
     </div>
